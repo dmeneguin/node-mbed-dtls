@@ -6,7 +6,7 @@ var dtls = require('../index');
 function identityPskCallback(id) {
   let psk = '';
 
-  switch (id)  {
+  switch (id.toString())  {
     case 'foo':
       psk = 'asdasdadasd';
       break;
