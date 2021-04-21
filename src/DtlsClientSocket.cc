@@ -9,7 +9,7 @@
 #define mbedtls_fprintf    fprintf
 
 
-using namespace node;
+using namespace Napi;
 
 static void my_debug( void *ctx, int level,
                       const char *file, int line,
@@ -40,124 +40,125 @@ int net_recv_cli( void *ctx, unsigned char *buf, size_t len ) {
 }
 
 
-Nan::Persistent<v8::FunctionTemplate> DtlsClientSocket::constructor;
+Napi::FunctionReference DtlsClientSocket::constructor;
 
-void DtlsClientSocket::Initialize(Nan::ADDON_REGISTER_FUNCTION_ARGS_TYPE target) {
-  Nan::HandleScope scope;
-
+Napi::Object DtlsClientSocket::Initialize(Napi::Env env, Napi::Object& exports) {
+  Napi::HandleScope scope(env);
   // Constructor
-  v8::Local<v8::FunctionTemplate> ctor = Nan::New<v8::FunctionTemplate>(DtlsClientSocket::New);
-  constructor.Reset(ctor);
-  v8::Local<v8::ObjectTemplate>  ctorInst = ctor->InstanceTemplate();
-  ctorInst->SetInternalFieldCount(1);
-  ctor->SetClassName(Nan::New("DtlsClientSocket").ToLocalChecked());
+	Napi::Function func = DefineClass(env, "DtlsClientSocket", {
+		InstanceMethod("receiveData", &DtlsClientSocket::ReceiveDataFromNode),
+		InstanceMethod("close", &DtlsClientSocket::Close),
+		InstanceMethod("send", &DtlsClientSocket::Send),
+		InstanceMethod("connect", &DtlsClientSocket::Connect),
+	});
 
-  Nan::SetPrototypeMethod(ctor, "receiveData", ReceiveDataFromNode);
-  Nan::SetPrototypeMethod(ctor, "close", Close);
-  Nan::SetPrototypeMethod(ctor, "send", Send);
-  Nan::SetPrototypeMethod(ctor, "connect", Connect);
+	constructor = Napi::Persistent(func);
+	constructor.SuppressDestruct();
 
-  Nan::Set(target, Nan::New("DtlsClientSocket").ToLocalChecked(), ctor->GetFunction());
+	exports.Set("DtlsClientSocket", func);
+
+	return exports;
 }
 
-/*
- * Node wrapper to the client socket constructor.
- */
-void DtlsClientSocket::New(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-  size_t priv_key_len     = (info[0]->BooleanValue()) ? Buffer::Length(info[0]) : 0;
-  size_t peer_pub_key_len = (info[1]->BooleanValue()) ? Buffer::Length(info[1]) : 0;
-  size_t ca_len           = (info[2]->BooleanValue()) ? Buffer::Length(info[2]) : 0;
-  size_t psk_len          = (info[3]->BooleanValue()) ? Buffer::Length(info[3]) : 0;
-  size_t ident_len        = (info[4]->BooleanValue()) ? Buffer::Length(info[4]) : 0;
+Napi::Value DtlsClientSocket::ReceiveDataFromNode(const Napi::CallbackInfo& info) {
+	Napi::Env env = info.Env();
+	Napi::HandleScope scope(env);
 
-  const unsigned char* priv_key     = (priv_key_len)     ? (const unsigned char *) Buffer::Data(info[0]) : NULL;
-  const unsigned char* peer_pub_key = (peer_pub_key_len) ? (const unsigned char *) Buffer::Data(info[1]) : NULL;
-  const unsigned char* _ca_pem      = (ca_len)           ? (const unsigned char *) Buffer::Data(info[2]) : NULL;
-  const unsigned char* _psk         = (psk_len)          ? (const unsigned char *) Buffer::Data(info[3]) : NULL;
-  const unsigned char* _ident       = (ident_len)        ? (const unsigned char *) Buffer::Data(info[4]) : NULL;
+	if (info.Length() >= 1 && info[0].IsBuffer()) {
+		Napi::Buffer<unsigned char> recv = info[0].As<Napi::Buffer<unsigned char>>();
+		store_data(reinterpret_cast<unsigned char *>(recv.Data()), recv.Length());
+	}
 
-  Nan::Callback* send_cb  = new Nan::Callback(info[5].As<v8::Function>());
-  Nan::Callback* hs_cb    = new Nan::Callback(info[6].As<v8::Function>());
-  Nan::Callback* error_cb = new Nan::Callback(info[7].As<v8::Function>());
+	unsigned char buf[RECV_BUF_LENGTH];
+	memset(buf, 0, RECV_BUF_LENGTH);
+	int len = receive_data(buf, RECV_BUF_LENGTH);
+  
+  return len > 0 ? Napi::Buffer<unsigned char>::Copy(env, buf, len) : env.Undefined();
+}
+
+Napi::Value DtlsClientSocket::Close(const Napi::CallbackInfo& info) {
+	Napi::Env env = info.Env();
+	int ret = close();
+
+	return Napi::Number::New(env, ret);
+}
+
+Napi::Value DtlsClientSocket::Send(const Napi::CallbackInfo& info) {
+	Napi::Env env = info.Env();
+	Napi::Buffer<unsigned char> buf = info[0].As<Napi::Buffer<unsigned char>>();
+	int ret = send(buf.Data(), buf.Length());
+	return Napi::Number::New(env, ret);
+}
+
+
+Napi::Value DtlsClientSocket::Connect(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  mbedtls_ssl_set_bio(&ssl_context, this, net_send_cli, net_recv_cli, NULL);
+	int ret = step();
+	return Napi::Number::New(env, ret);
+}
+
+
+DtlsClientSocket::DtlsClientSocket(const Napi::CallbackInfo& info) :
+		Napi::ObjectWrap<DtlsClientSocket>(info),
+		env(info.Env()) {
+	Napi::HandleScope scope(env);
+
+  size_t priv_key_len = 0;
+  size_t ca_pem_len = 0;
+  size_t psk_len = 0;
+  size_t ident_len = 0;
+  unsigned char * priv_key =  NULL;
+  unsigned char * ca_pem =  NULL;
+  unsigned char * psk =  NULL;
+  unsigned char * ident =  NULL;
+
+  if(info[0].IsBuffer()){
+    Napi::Buffer<unsigned char> priv_key_buffer = info[0].As<Napi::Buffer<unsigned char>>();
+    priv_key_len = priv_key_buffer.Length();
+    priv_key = (priv_key_len) ? priv_key_buffer.Data() : NULL;
+  } else {
+    mbedtls_printf("priv key is null\n");
+  }
+
+  if(info[2].IsBuffer()){
+    Napi::Buffer<unsigned char> ca_pem_buffer = info[2].As<Napi::Buffer<unsigned char>>();
+    ca_pem_len = ca_pem_buffer.Length();
+    ca_pem = (ca_pem_len) ? ca_pem_buffer.Data() : NULL;
+  } else {
+    mbedtls_printf("ca pem is null\n");
+  }
+
+  if(info[3].IsBuffer()){
+    Napi::Buffer<unsigned char> psk_buffer = info[3].As<Napi::Buffer<unsigned char>>();
+    psk_len = psk_buffer.Length();
+    psk = (psk_len) ? psk_buffer.Data() : NULL;
+  } else {
+    mbedtls_printf("psk is null\n");
+  }
+
+  if(info[4].IsBuffer()){
+    Napi::Buffer<unsigned char> ident_buffer = info[4].As<Napi::Buffer<unsigned char>>();
+    ident_len = ident_buffer.Length();
+    ident = (ident_len) ? ident_buffer.Data() : NULL;
+  } else {
+    mbedtls_printf("ident is null\n");
+  }
+
+  send_cb  = Napi::Persistent(info[5].As<Napi::Function>());
+  handshake_cb    = Napi::Persistent(info[6].As<Napi::Function>());
+  error_cb = Napi::Persistent(info[7].As<Napi::Function>());
 
   int debug_level = 0;
   if (info.Length() > 8) {
-    debug_level = info[8]->Uint32Value();
+    debug_level = info[8].ToNumber().Uint32Value();
   }
 
-  DtlsClientSocket *socket = new DtlsClientSocket(
-    priv_key, priv_key_len,
-    peer_pub_key, peer_pub_key_len,
-    _ca_pem, ca_len,
-    _psk,    psk_len,
-    _ident,  ident_len,
-    send_cb, hs_cb, error_cb,
-    debug_level);
-  socket->Wrap(info.This());
-  info.GetReturnValue().Set(info.This());
-}
-
-
-void DtlsClientSocket::ReceiveDataFromNode(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-  DtlsClientSocket *socket = Nan::ObjectWrap::Unwrap<DtlsClientSocket>(info.This());
-  const unsigned char *recv_data = (const unsigned char *)Buffer::Data(info[0]);
-  socket->store_data(recv_data, Buffer::Length(info[0]));
-
-  int len = 1284;
-  unsigned char buf[len];
-  len = socket->receive_data(buf, len);
-
-  if (len > 0) {
-    info.GetReturnValue().Set(Nan::CopyBuffer((char*)buf, len).ToLocalChecked());
-  }
-}
-
-
-void DtlsClientSocket::Close(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-  DtlsClientSocket *socket = Nan::ObjectWrap::Unwrap<DtlsClientSocket>(info.This());
-  int ret = socket->close();
-  if (ret < 0) {
-    mbedtls_printf("Unexpected return value from socket->close(): %d.\n", ret);
-    return;
-  }
-
-  info.GetReturnValue().Set(Nan::New(ret));
-}
-
-
-void DtlsClientSocket::Send(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-  DtlsClientSocket *socket = Nan::ObjectWrap::Unwrap<DtlsClientSocket>(info.This());
-  const unsigned char *send_data = (const unsigned char *)Buffer::Data(info[0]);
-  socket->send(send_data, Buffer::Length(info[0]));
-}
-
-
-void DtlsClientSocket::Connect(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-  DtlsClientSocket *socket = Nan::ObjectWrap::Unwrap<DtlsClientSocket>(info.This());
-  mbedtls_ssl_set_bio(&socket->ssl_context, socket, net_send_cli, net_recv_cli, NULL);
-  socket->step();
-}
-
-
-DtlsClientSocket::DtlsClientSocket(
-                       const unsigned char *priv_key,     size_t priv_key_len,
-                       const unsigned char *peer_pub_key, size_t peer_pub_key_len,
-                       const unsigned char *ca_pem,       size_t ca_pem_len,
-                       const unsigned char *psk,          size_t psk_len,
-                       const unsigned char *ident,        size_t ident_len,
-                       Nan::Callback* send_callback,
-                       Nan::Callback* hs_callback,
-                       Nan::Callback* error_callback,
-                       int debug_level)
-    : Nan::ObjectWrap(),
-    send_cb(send_callback),
-    error_cb(error_callback),
-    handshake_cb(hs_callback) {
   int ret;
   const char *pers = "dtls_client";
 
   recv_len = 0;
-  recv_buf = NULL;
+  recv_buf = nullptr;
 
   #if defined(MBEDTLS_DEBUG_C)
     mbedtls_debug_set_threshold(debug_level);
@@ -242,11 +243,9 @@ exit:
 }
 
 int DtlsClientSocket::send_encrypted(const unsigned char *buf, size_t len) {
-  v8::Local<v8::Value> argv[] = {
-    Nan::CopyBuffer((char *)buf, len).ToLocalChecked()
-  };
-  v8::Local<v8::Function> sendCallbackDirect = send_cb->GetFunction();
-  sendCallbackDirect->Call(Nan::GetCurrentContext()->Global(), 1, argv);
+  send_cb.Call({
+		Napi::Buffer<unsigned char>::Copy(env, (unsigned char *)buf, len)
+	});
   return len;
 }
 
@@ -344,8 +343,7 @@ int DtlsClientSocket::step() {
 
   if (ssl_context.state == MBEDTLS_SSL_HANDSHAKE_OVER) {
     // this should only be called once when we first finish the handshake
-    v8::Local<v8::Function> handshakeCallbackDirect = handshake_cb->GetFunction();
-    handshakeCallbackDirect->Call(Nan::GetCurrentContext()->Global(), 0, NULL);
+    handshake_cb.Call({});
   }
   return 0;
 }
@@ -353,20 +351,19 @@ int DtlsClientSocket::step() {
 
 
 void DtlsClientSocket::throwError(int ret) {
-  char error_buf[100];
-  mbedtls_strerror(ret, error_buf, 100);
-  Nan::ThrowError(error_buf);
+	char error_buf[255];
+	mbedtls_strerror(ret, error_buf, 254);
+	Napi::Error::New(env, error_buf).ThrowAsJavaScriptException();
+
 }
 
 void DtlsClientSocket::error(int ret) {
-  char error_buf[100];
-  mbedtls_strerror(ret, error_buf, 100);
-  v8::Local<v8::Value> argv[] = {
-    Nan::New(ret),
-    Nan::New(error_buf).ToLocalChecked()
-  };
-  v8::Local<v8::Function> errorCallbackDirect = error_cb->GetFunction();
-  errorCallbackDirect->Call(Nan::GetCurrentContext()->Global(), 2, argv);
+	char error_buf[255];
+	mbedtls_strerror(ret, error_buf, 254);
+  error_cb.Call({
+		Napi::Number::New(env, ret),
+		Napi::String::New(env, error_buf)
+	});
 }
 
 void DtlsClientSocket::store_data(const unsigned char *buf, size_t len) {
@@ -382,12 +379,6 @@ int DtlsClientSocket::close() {
 }
 
 DtlsClientSocket::~DtlsClientSocket() {
-  delete send_cb;
-  send_cb = nullptr;
-  delete error_cb;
-  error_cb = nullptr;
-  delete handshake_cb;
-  handshake_cb = nullptr;
   recv_buf = nullptr;
   mbedtls_x509_crt_free(&clicert);
   mbedtls_x509_crt_free(&cacert);

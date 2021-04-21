@@ -6,7 +6,7 @@
 #define mbedtls_printf     printf
 #define mbedtls_fprintf    fprintf
 
-using namespace node;
+using namespace Napi;
 
 static void my_debug( void *ctx, int level,
                       const char *file, int line,
@@ -51,60 +51,56 @@ clean_and_exit:
 }
 
 
-Nan::Persistent<v8::FunctionTemplate> DtlsServer::constructor;
+Napi::FunctionReference DtlsServer::constructor;
 
-void DtlsServer::Initialize(Nan::ADDON_REGISTER_FUNCTION_ARGS_TYPE target) {
-  Nan::HandleScope scope;
+Napi::Object DtlsServer::Initialize(Napi::Env env, Napi::Object exports) {
+	Napi::HandleScope scope(env);
 
-  // Constructor
-  v8::Local<v8::FunctionTemplate> ctor = Nan::New<v8::FunctionTemplate>(DtlsServer::New);
-  constructor.Reset(ctor);
-  v8::Local<v8::ObjectTemplate>  ctorInst = ctor->InstanceTemplate();
-  ctorInst->SetInternalFieldCount(1);
-  ctor->SetClassName(Nan::New("DtlsServer").ToLocalChecked());
+	Napi::Function func = DefineClass(env, "DtlsServer", {
+		InstanceAccessor("handshakeTimeoutMin", nullptr, &DtlsServer::SetHandshakeTimeoutMin),
+	});
 
-  Nan::SetAccessor(ctorInst, Nan::New("handshakeTimeoutMin").ToLocalChecked(), 0, SetHandshakeTimeoutMin);
+	constructor = Napi::Persistent(func);
+	constructor.SuppressDestruct();
 
-  Nan::Set(target, Nan::New("DtlsServer").ToLocalChecked(), ctor->GetFunction());
+	exports.Set("DtlsServer", func);
+
+	return exports;
 }
 
-void DtlsServer::New(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+DtlsServer::DtlsServer(const Napi::CallbackInfo& info) : Napi::ObjectWrap<DtlsServer>(info),
+		env(info.Env())  {
+
   if (info.Length() < 2) {
-    return Nan::ThrowTypeError("Expecting at least two parameters");
+    Napi::TypeError::New(env, "Expecting at least two parameters").ThrowAsJavaScriptException();
+    return;
   }
 
-  if (!Buffer::HasInstance(info[0])) {
-    return Nan::ThrowTypeError("Expecting key to be a buffer");
+  if (!info[0].IsBuffer()) {
+    Napi::TypeError::New(env, "Expecting key to be a buffer").ThrowAsJavaScriptException();
+    return;
   }
 
-  if (info[1]->IsFunction() == false) {
-   return Nan::ThrowTypeError("Expecting param 2 to be a function"); 
+  if (info[1].IsFunction() == false) {
+   Napi::TypeError::New(env, "Expecting param 2 to be a function").ThrowAsJavaScriptException();
+   return; 
   }
 
-  size_t key_len = Buffer::Length(info[0]);
+	Napi::Buffer<unsigned char> key_buffer = info[0].As<Napi::Buffer<unsigned char>>();
+	size_t key_len = key_buffer.Length();
+	unsigned char * key = key_buffer.Data();
 
-  const unsigned char *key = (const unsigned char *)Buffer::Data(info[0]);
-
-  Nan::Callback* get_psk  = new Nan::Callback(info[1].As<v8::Function>());
+  get_psk = Napi::Persistent(info[1].As<Napi::Function>());
 
   int debug_level = 0;
   if (info.Length() > 1) {
-    debug_level = info[2]->Uint32Value();
+    debug_level = info[2].ToNumber().Uint32Value();
   }
 
-  DtlsServer *server = new DtlsServer(key, key_len,get_psk, debug_level);
-  server->Wrap(info.This());
-  info.GetReturnValue().Set(info.This());
-}
+  //key     key_len  
+  //srv_key srv_key_len  
 
-DtlsServer::DtlsServer(const unsigned char *srv_key,
-                       size_t srv_key_len,
-                       Nan::Callback* get_psk_cb,
-                       int debug_level)
-    : Nan::ObjectWrap() {
   int ret;
-
-  get_psk = get_psk_cb;
 
   const char *pers = "dtls_server";
   mbedtls_ssl_config_init(&conf);
@@ -124,8 +120,8 @@ DtlsServer::DtlsServer(const unsigned char *srv_key,
 #endif
 
   ret = mbedtls_pk_parse_key(&pkey,
-               (const unsigned char *)srv_key,
-               srv_key_len,
+               (const unsigned char *)key,
+               key_len,
                NULL,
                0);
   if (ret != 0) goto exit;
@@ -172,25 +168,23 @@ exit:
   return;
 }
 
-NAN_SETTER(DtlsServer::SetHandshakeTimeoutMin) {
-  DtlsServer *server = Nan::ObjectWrap::Unwrap<DtlsServer>(info.This());
-  mbedtls_ssl_conf_handshake_timeout(server->config(), value->Uint32Value(), server->config()->hs_timeout_max);
+void DtlsServer::SetHandshakeTimeoutMin(const Napi::CallbackInfo& info, const Napi::Value& value) {
+  uint32_t hs_timeout_min = value.As<Napi::Number>().Uint32Value();
+	mbedtls_ssl_conf_handshake_timeout(this->config(), hs_timeout_min, this->config()->hs_timeout_max);
 }
 
 char *DtlsServer::getPskFromIdentity(char *identity) {
   char *psk = NULL;
-
-  v8::Local<v8::Value> argv[] = {
-    Nan::New(identity).ToLocalChecked()
-  };
-  v8::Local<v8::Function> getPskCallback = get_psk->GetFunction();
-  v8::Local<v8::Value> jsPsk = getPskCallback->Call(Nan::GetCurrentContext()->Global(), 1, argv);
-
-  Nan::Utf8String jsUtf8Psk(jsPsk->ToString());
+  std::string identity_string = identity;
+  Napi::Value jsPsk = get_psk.Call({
+		Napi::Buffer<unsigned char>::Copy(env, (unsigned char *)identity, (size_t)identity_string.length())
+	});
+  Napi::String jsPsk_string = jsPsk.As<Napi::String>();
+  std::string jsUtf8Psk = jsPsk_string.Utf8Value();
   int pskLen = jsUtf8Psk.length();
   if (pskLen > 0) {
     psk = (char *)malloc(sizeof(char)*(pskLen+1));
-    strcpy(psk,*jsUtf8Psk);
+    strcpy(psk, &jsUtf8Psk[0]);
   }
 
   return psk;
@@ -199,7 +193,8 @@ char *DtlsServer::getPskFromIdentity(char *identity) {
 void DtlsServer::throwError(int ret) {
   char error_buf[100];
   mbedtls_strerror(ret, error_buf, 100);
-  Nan::ThrowError(error_buf);
+  Napi::Error::New(env, error_buf).ThrowAsJavaScriptException();
+
 }
 
 DtlsServer::~DtlsServer() {
