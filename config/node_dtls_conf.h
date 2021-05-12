@@ -8,7 +8,7 @@
 #define MBEDTLS_SSL_SRV_C
 #define MBEDTLS_SSL_CLI_C
 
-#define MBEDTLS_PSK_MAX_LEN    16
+#define MBEDTLS_PSK_MAX_LEN    32
 
 #define MBEDTLS_HAVE_ASM
 #define MBEDTLS_HAVE_TIME
